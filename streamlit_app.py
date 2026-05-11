@@ -41,6 +41,22 @@ def _run_comparison(df_csv: pd.DataFrame, df_xlsx: pd.DataFrame) -> tuple[pd.Dat
             .sum()
             .sort_values("Account Name")
         )
+    elif {"Ship To", "Net"}.issubset(set(df_xlsx.columns)):
+        df_xlsx.rename(columns={"Ship To": "Account Name"}, inplace=True)
+        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["Net"], errors="coerce").fillna(0)
+        df_xlsx = (
+            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
+            .sum()
+            .sort_values("Account Name")
+        )
+    elif {"Ship To", "Shipped"}.issubset(set(df_xlsx.columns)):
+        df_xlsx.rename(columns={"Ship To": "Account Name", "Shipped": "Total Quantity"}, inplace=True)
+        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["Total Quantity"], errors="coerce").fillna(0)
+        df_xlsx = (
+            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
+            .sum()
+            .sort_values("Account Name")
+        )
     else:
         raise KeyError(
             "Unrecognized Guidepoint invoice format. "
@@ -86,6 +102,10 @@ if run:
     try:
         df_csv = pd.read_csv(ccd_file)
         df_xlsx = pd.read_excel(invoice_file)
+        # Detect title row: if columns contain "Unnamed" entries, re-read with header=1
+        if any('Unnamed' in str(c) for c in df_xlsx.columns):
+            invoice_file.seek(0)
+            df_xlsx = pd.read_excel(invoice_file, header=1)
 
         sheet1, sheet2 = _run_comparison(df_csv, df_xlsx)
 
