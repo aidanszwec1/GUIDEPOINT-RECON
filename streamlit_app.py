@@ -1,138 +1,120 @@
 import io
-from datetime import datetime
+import sys
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+# Make `src/account_comparison.py` importable when this lives at project root
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "SCRIPT (DO NOT TOUCH)"))
 
-st.set_page_config(page_title="Account Comparison", layout="centered")
-
-st.title("Account Comparison")
-st.write("Upload the CCD CSV and the Guidepoint invoice XLSX, then run the comparison.")
-
-ccd_file = st.file_uploader("CCD Add/Replace (CSV)", type=["csv"], accept_multiple_files=False)
-invoice_file = st.file_uploader("Guidepoint Invoice (XLSX)", type=["xlsx"], accept_multiple_files=False)
-
-run = st.button("Run comparison", type="primary", disabled=not (ccd_file and invoice_file))
+from account_comparison import run_comparison, write_excel  # noqa: E402
 
 
-def _run_comparison(df_csv: pd.DataFrame, df_xlsx: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df_csv = df_csv.copy()
-    df_xlsx = df_xlsx.copy()
+st.set_page_config(page_title="Guidepoint Invoice Reconciliation", layout="centered")
 
-    df_csv.rename(columns={"Account Name": "Account Name", "CCD Quantity": "CCD Quantity"}, inplace=True)
-    df_xlsx.columns = df_xlsx.columns.astype(str).str.replace("\n", " ", regex=False).str.strip()
+st.title("Guidepoint Invoice Reconciliation")
+st.write(
+    "Upload the SFDC Customer Orders report (with Shipping Info) and the Guidepoint "
+    "hardware invoice. The script verifies every line on the invoice against SFDC orders."
+)
 
-    if {"Ship To Dealer", "Shipped"}.issubset(set(df_xlsx.columns)):
-        df_xlsx.rename(columns={"Ship To Dealer": "Account Name", "Shipped": "Total Quantity"}, inplace=True)
-    elif {"Ship To", "New Unit"}.issubset(set(df_xlsx.columns)):
-        df_xlsx.rename(columns={"Ship To": "Account Name"}, inplace=True)
-        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["New Unit"], errors="coerce").fillna(0)
-        df_xlsx = (
-            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
-            .sum()
-            .sort_values("Account Name")
-        )
-    elif {"Ship to Customer Name", "New Unit"}.issubset(set(df_xlsx.columns)):
-        df_xlsx.rename(columns={"Ship to Customer Name": "Account Name"}, inplace=True)
-        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["New Unit"], errors="coerce").fillna(0)
-        df_xlsx = (
-            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
-            .sum()
-            .sort_values("Account Name")
-        )
-    elif {"Ship To", "Net"}.issubset(set(df_xlsx.columns)):
-        df_xlsx.rename(columns={"Ship To": "Account Name"}, inplace=True)
-        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["Net"], errors="coerce").fillna(0)
-        df_xlsx = (
-            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
-            .sum()
-            .sort_values("Account Name")
-        )
-    elif {"Ship To", "Shipped"}.issubset(set(df_xlsx.columns)):
-        df_xlsx.rename(columns={"Ship To": "Account Name", "Shipped": "Total Quantity"}, inplace=True)
-        df_xlsx["Total Quantity"] = pd.to_numeric(df_xlsx["Total Quantity"], errors="coerce").fillna(0)
-        df_xlsx = (
-            df_xlsx.groupby("Account Name", as_index=False)["Total Quantity"]
-            .sum()
-            .sort_values("Account Name")
-        )
-    else:
-        raise KeyError(
-            "Unrecognized Guidepoint invoice format. "
-            "Expected either columns: Ship To Dealer + Shipped (legacy) "
-            "or Ship To + New Unit (new Summary format). "
-            "Found columns: "
-            + ", ".join(map(str, df_xlsx.columns))
-        )
+with st.expander("Expected inputs", expanded=False):
+    st.markdown(
+        """
+        **SFDC report** (`.xlsx` or `.csv`) — required columns:
+        Order Name, DW Location Name, Created Date, Expected Date of Arrival,
+        Quantity Shipped, Number of Connected Car Devices, Number of CCD Replacement,
+        Shipping Record Number.
 
-    required_csv_cols = {"Account Name", "CCD Quantity"}
-    required_xlsx_cols = {"Account Name", "Total Quantity"}
+        Report type: *Customer Orders with Shipping Details*.
+        Filter: `Expected Date of Arrival` in invoice month + 1 month prior.
+        Rows with blank shipping info are dropped automatically.
 
-    missing_csv = sorted(required_csv_cols - set(df_csv.columns))
-    if missing_csv:
-        raise KeyError(
-            "CSV is missing required column(s): "
-            + ", ".join(missing_csv)
-            + "\nFound columns: "
-            + ", ".join(map(str, df_csv.columns))
-        )
+        **Guidepoint invoice** (`.xlsx`) — must contain a `Data` sheet with columns:
+        Type, Reference Nbr., Date, Dealer Ship To, Amount, New Units, Refurb Units,
+        Shipping Costs, Customs Fees.
 
-    missing_xlsx = sorted(required_xlsx_cols - set(df_xlsx.columns))
-    if missing_xlsx:
-        raise KeyError(
-            "XLSX is missing required column(s): "
-            + ", ".join(missing_xlsx)
-            + "\nFound columns: "
-            + ", ".join(map(str, df_xlsx.columns))
-        )
+        Harnesses excluded. Credit memos handled via signed quantities.
+        """
+    )
 
-    merged = pd.merge(df_csv, df_xlsx, on="Account Name", how="inner")
-    merged["Difference"] = merged["CCD Quantity"] - merged["Total Quantity"]
-    sheet1 = merged[["Account Name", "CCD Quantity", "Total Quantity", "Difference"]]
+sfdc_file = st.file_uploader(
+    "SFDC report (Customer Orders w/ Shipping Info)",
+    type=["xlsx", "csv"],
+)
+gp_file = st.file_uploader(
+    "Guidepoint hardware invoice",
+    type=["xlsx"],
+)
 
-    not_in_csv = df_xlsx[~df_xlsx["Account Name"].isin(df_csv["Account Name"])]
-    sheet2 = not_in_csv[["Account Name", "Total Quantity"]].copy()
-    sheet2.rename(columns={"Total Quantity": "TOTAL CCD Value"}, inplace=True)
+run = st.button("Run reconciliation", type="primary", disabled=not (sfdc_file and gp_file))
 
-    return sheet1, sheet2
+
+def _stash_upload(upload, suffix: str) -> Path:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(upload.getbuffer())
+    tmp.close()
+    return Path(tmp.name)
 
 
 if run:
     try:
-        df_csv = pd.read_csv(ccd_file)
-        df_xlsx = pd.read_excel(invoice_file)
-        # Detect title row: if columns contain "Unnamed" entries, re-read with header=1
-        if any('Unnamed' in str(c) for c in df_xlsx.columns):
-            invoice_file.seek(0)
-            df_xlsx = pd.read_excel(invoice_file, header=1)
+        sfdc_path = _stash_upload(sfdc_file, suffix=Path(sfdc_file.name).suffix)
+        gp_path = _stash_upload(gp_file, suffix=Path(gp_file.name).suffix)
 
-        sheet1, sheet2 = _run_comparison(df_csv, df_xlsx)
+        with st.spinner("Reconciling…"):
+            sheets, window_start = run_comparison(sfdc_path, gp_path)
 
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-            sheet1.to_excel(writer, sheet_name="Matched Accounts", index=False)
-            sheet2.to_excel(writer, sheet_name="XLSX Only Accounts", index=False)
+        invoice_month_ts = window_start + pd.offsets.MonthBegin(1)
+        invoice_month = invoice_month_ts.strftime("%b").upper()
+        invoice_year = invoice_month_ts.strftime("%Y")
 
-        out.seek(0)
+        st.success(
+            f"Reconciled invoice month: {invoice_month} {invoice_year} "
+            f"(SFDC window: {window_start.date()} → {(invoice_month_ts + pd.offsets.MonthEnd(0)).date()})"
+        )
 
-        output_filename = f"ACCOUNT_COMPARISON_{datetime.now().strftime('%b_%d_%Y')}.xlsx"
+        # Build the Excel output
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            tmp_path = Path(tmp.name)
+        write_excel(sheets, tmp_path)
+        with open(tmp_path, "rb") as f:
+            buf = io.BytesIO(f.read())
+        buf.seek(0)
 
-        st.success("Comparison complete.")
         st.download_button(
-            label="Download output Excel",
-            data=out,
-            file_name=output_filename,
+            label=f"📥 Download ACCOUNT_COMPARISON_{invoice_month}_{invoice_year}.xlsx",
+            data=buf,
+            file_name=f"ACCOUNT_COMPARISON_{invoice_month}_{invoice_year}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        with st.expander("Preview: Matched Accounts", expanded=False):
-            st.dataframe(sheet1, use_container_width=True)
+        # Summary metrics
+        invoice_detail = sheets["Invoice Line Detail"]
+        rollup = sheets["Ship-To Rollup"]
+        unmatched = sheets["Unmatched Invoice Lines"]
 
-        with st.expander("Preview: XLSX Only Accounts", expanded=False):
-            st.dataframe(sheet2, use_container_width=True)
+        matched_lines = len(invoice_detail) - len(unmatched)
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Invoice lines", len(invoice_detail))
+        col2.metric("Matched", matched_lines)
+        col3.metric("Unmatched", len(unmatched))
+        col4.metric("Ship-tos", len(rollup))
+
+        # Previews
+        with st.expander("Invoice Line Detail", expanded=True):
+            st.dataframe(invoice_detail, use_container_width=True)
+        with st.expander("Ship-To Rollup"):
+            st.dataframe(rollup, use_container_width=True)
+        with st.expander("Unmatched Invoice Lines (action items)"):
+            st.dataframe(unmatched, use_container_width=True)
 
     except KeyError as e:
-        st.error(str(e))
+        st.error(f"Column mismatch:\n{e}")
     except Exception as e:
-        st.error(str(e))
+        st.error(f"{type(e).__name__}: {e}")
+        st.exception(e)
+
