@@ -344,7 +344,7 @@ def infer_invoice_window(gp_path: Path) -> tuple:
     else:
         ym = dates.dt.to_period("M").mode()[0]
         invoice_month_start = ym.to_timestamp()
-    invoice_month_end = invoice_month_start + pd.offsets.MonthEnd(0)
+    invoice_month_end = invoice_month_start + pd.offsets.MonthEnd(0) + pd.offsets.MonthEnd(1)
     window_start = invoice_month_start - pd.offsets.MonthBegin(1)
     return window_start, invoice_month_end
 
@@ -452,3 +452,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
